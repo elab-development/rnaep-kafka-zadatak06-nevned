@@ -3,7 +3,9 @@ from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
 from contextlib import asynccontextmanager
 from typing import List
 from models import Product
-import asyncio, json
+import asyncio
+import json
+from datetime import datetime
 
 producer = AIOKafkaProducer(bootstrap_servers='kafka:9092')
 
@@ -11,8 +13,8 @@ producer = AIOKafkaProducer(bootstrap_servers='kafka:9092')
 async def lifespan(app: FastAPI):
     await producer.start()
     consumer = AIOKafkaConsumer(
-        "order-created", 
-        bootstrap_servers='kafka:9092', 
+        "order-created",
+        bootstrap_servers='kafka:9092',
         group_id="products-group",
         auto_offset_reset="earliest"
     )
@@ -32,20 +34,56 @@ products_db = {
     2: Product(id=2, name="Mouse", price=25.0, quantity=50)
 }
 
+async def send_error_event(topic: str, order_id: int, product_id: int, reason: str):
+    payload = {
+        "order_id": order_id,
+        "product_id": product_id,
+        "timestamp": datetime.utcnow().isoformat(),
+        "error_reason": reason
+    }
+    await producer.send_and_wait(topic, json.dumps(payload).encode('utf-8'))
+
 async def consume(consumer: AIOKafkaConsumer):
     try:
         async for msg in consumer:
             order = json.loads(msg.value.decode('utf-8'))
-            product = products_db.get(order['product_id'])
+            order_id = order.get('id')
+            product_id = order.get('product_id')
+            requested_qty = order.get('quantity')
             
-            if product and product.quantity >= order['quantity']:
-                product.quantity -= order['quantity']
-                await producer.send_and_wait("order-confirmed", json.dumps({
-                    "order_id": order['id'],
-                    "product_id": product.id
-                }).encode('utf-8'))
+            product = products_db.get(product_id)
+            
+            
+            if not product:
+                await send_error_event(
+                    "product_not_found_events", 
+                    order_id, 
+                    product_id, 
+                    "Proizvod ne postoji u katalogu"
+                )
+                continue
+
+            
+            if product.quantity < requested_qty:
+                await send_error_event(
+                    "out_of_stock_events", 
+                    order_id, 
+                    product_id, 
+                    "Nedovoljna kolicina na stanju"
+                )
+                continue
+
+           
+            product.quantity -= requested_qty
+            await producer.send_and_wait("order-confirmed", json.dumps({
+                "order_id": order_id,
+                "product_id": product.id
+            }).encode('utf-8'))
+
     except asyncio.CancelledError:
         pass
+    except Exception as e:
+        print(f"Error in consumer: {e}")
 
 @app.get("/products")
 def get_products():
